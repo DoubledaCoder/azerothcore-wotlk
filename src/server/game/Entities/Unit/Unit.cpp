@@ -7417,15 +7417,15 @@ bool Unit::AttackStop()
 
 void Unit::CombatStop(bool includingCast)
 {
+    sScriptMgr->OnUnitStopCombat(this);
     if (includingCast && IsNonMeleeSpellCast(false))
         InterruptNonMeleeSpells(false);
-
     AttackStop();
     RemoveAllAttackers();
     if (IsPlayer())
         ToPlayer()->SendAttackSwingCancelAttack();     // melee and ranged forced attack cancel
-    if (Creature* pCreature = ToCreature())
-        pCreature->ClearLastLeashExtensionTimePtr();
+    if (Creature* pCreature = ToCreature()){
+        pCreature->ClearLastLeashExtensionTimePtr();}
     ClearInCombat();
 
     // xinef: just in case
