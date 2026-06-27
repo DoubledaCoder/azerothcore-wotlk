@@ -954,6 +954,9 @@ bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, uint32 effectMask, Unit 
             for (auto const& [immunitySchoolMask, immunityAuraId] : schoolList)
             {
                 SpellInfo const* immuneSpellInfo = sSpellMgr->GetSpellInfo(immunityAuraId);
+                if (immunityAuraId == spellInfo->Id)
+                    continue;
+
                 if ((immunitySchoolMask & schoolMask) != schoolMask)
                     continue;
 
@@ -1229,7 +1232,7 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
         {
             uint32 unDamage = health < damage ? health : damage;
             bool damagedByPlayer = unDamage && attacker && (attacker->IsPlayer() || attacker->m_movedByPlayer != nullptr
-                || attacker->GetCharmerOrOwnerGUID().IsPlayer());
+                || attacker->GetCharmerGUID().IsPlayer());
             victim->ToCreature()->LowerPlayerDamageReq(unDamage, damagedByPlayer);
         }
     }
@@ -1552,28 +1555,32 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                 {
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
 
-                    // Calculate crit bonus
-                    uint32 crit_bonus = damage;
-                    // Apply crit_damage bonus for melee spells
-                    if (Player* modOwner = GetSpellModOwner())
-                        modOwner->ApplySpellMod(spellInfo->Id, SPELLMOD_CRIT_DAMAGE_BONUS, crit_bonus);
-                    damage += crit_bonus;
+                    // Calculate crit bonus (100% for melee/ranged spells)
+                    int32 crit_bonus = damage;
+                    crit_bonus += damage;
 
                     // Apply SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE or SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE
-                    float critPctDamageMod = 0.0f;
+                    float crit_mod = 0.0f;
                     if (attackType == RANGED_ATTACK)
-                        critPctDamageMod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE);
+                        crit_mod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE);
                     else
-                        critPctDamageMod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE);
+                        crit_mod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE);
 
                     // Increase crit damage from SPELL_AURA_MOD_CRIT_DAMAGE_BONUS
-                    critPctDamageMod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_DAMAGE_BONUS, spellInfo->GetSchoolMask());
-
+                    crit_mod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_DAMAGE_BONUS, spellInfo->GetSchoolMask());
                     // Increase crit damage from SPELL_AURA_MOD_CRIT_PERCENT_VERSUS
-                    critPctDamageMod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_PERCENT_VERSUS, crTypeMask);
+                    crit_mod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_PERCENT_VERSUS, crTypeMask);
 
-                    if (critPctDamageMod != 0)
-                        AddPct(damage, critPctDamageMod);
+                    if (crit_bonus != 0 && crit_mod != 0.0f)
+                        AddPct(crit_bonus, crit_mod);
+
+                    crit_bonus -= damage;
+
+                    // adds additional damage to critBonus (from talents)
+                    if (Player* modOwner = GetSpellModOwner())
+                        modOwner->ApplySpellMod(spellInfo->Id, SPELLMOD_CRIT_DAMAGE_BONUS, crit_bonus);
+
+                    damage = crit_bonus + damage;
                 }
 
                 // Spell weapon based damage CAN BE crit & blocked at same time
@@ -8387,8 +8394,10 @@ void Unit::EnergizeBySpell(Unit* victim, uint32 spellID, uint32 damage, Powers p
 {
     victim->ModifyPower(powerType, damage, false);
 
-    if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellID))
-        victim->GetThreatMgr().ForwardThreatForAssistingMe(this, float(damage) / 2.0f, spellInfo, true);
+    // Happiness is internal hunter pet state, not combat assistance — energizing it must not generate threat
+    if (powerType != POWER_HAPPINESS)
+        if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellID))
+            victim->GetThreatMgr().ForwardThreatForAssistingMe(this, float(damage) / 2.0f, spellInfo, true);
 
     SendEnergizeSpellLog(victim, spellID, damage, powerType);
 }
@@ -9385,7 +9394,6 @@ uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spell
     {
         case SPELL_DAMAGE_CLASS_MELEE:                      // for melee based spells is 100%
         case SPELL_DAMAGE_CLASS_RANGED:
-            /// @todo: write here full calculation for melee/ranged spells
             crit_bonus += damage;
             break;
         default:
@@ -10018,7 +10026,12 @@ bool Unit::IsImmunedToAuraPeriodicTick(Unit const* caster, SpellInfo const* spel
     return false;
 }
 
-bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Spell const* spell)
+bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Unit const* caster)
+{
+    return IsImmunedToSpell(spellInfo, caster, spellInfo ? spellInfo->GetSchoolMask() : SPELL_SCHOOL_MASK_NONE);
+}
+
+bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Unit const* caster, SpellSchoolMask spellSchoolMask)
 {
     if (!spellInfo)
         return false;
@@ -10064,7 +10077,7 @@ bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Spell const* spell)
             continue;
 
         // Xinef: if target is immune to one effect, and the spell has transform aura - it is immune to whole spell
-        if (IsImmunedToSpellEffect(spellInfo, i))
+        if (IsImmunedToSpellEffect(spellInfo, i, caster))
         {
             if (spellInfo->HasAura(SPELL_AURA_TRANSFORM))
                 return true;
@@ -10079,23 +10092,19 @@ bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Spell const* spell)
 
     if (!spellInfo->HasAttribute(SPELL_ATTR2_NO_SCHOOL_IMMUNITIES))
     {
-        SpellSchoolMask spellSchoolMask = spellInfo->GetSchoolMask();
-        Unit const* spellCaster = spell ? spell->GetCaster() : nullptr;
-        if (spell)
-        {
-            spellSchoolMask = spell->GetSpellSchoolMask();
-        }
-
         if (spellSchoolMask != SPELL_SCHOOL_MASK_NONE)
         {
             SpellImmuneContainer const& schoolList = m_spellImmune[IMMUNITY_SCHOOL];
             for (auto itr = schoolList.begin(); itr != schoolList.end(); ++itr)
             {
+                if (itr->second == spellInfo->Id)
+                    continue;
+
                 SpellInfo const* immuneSpellInfo = sSpellMgr->GetSpellInfo(itr->second);
                 if (!(itr->first & spellSchoolMask))
                     continue;
 
-                if (IgnoresSchoolImmunityFromFriendlyCaster(spellCaster, itr->second, immuneSpellInfo))
+                if (IgnoresSchoolImmunityFromFriendlyCaster(caster, itr->second, immuneSpellInfo))
                     continue;
 
                 if (spellInfo->CanPierceImmuneAura(immuneSpellInfo))
@@ -10107,6 +10116,16 @@ bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Spell const* spell)
     }
 
     return false;
+}
+
+bool Unit::IsImmunedToSpell(SpellInfo const* spellInfo, Spell const* spell)
+{
+    if (!spellInfo)
+        return false;
+
+    Unit const* spellCaster = spell ? spell->GetCaster() : nullptr;
+    SpellSchoolMask spellSchoolMask = spell ? spell->GetSpellSchoolMask() : spellInfo->GetSchoolMask();
+    return IsImmunedToSpell(spellInfo, spellCaster, spellSchoolMask);
 }
 
 bool Unit::IsImmunedToSpellEffect(SpellInfo const* spellInfo, uint32 index, Unit const* caster /*= nullptr*/) const
@@ -10622,6 +10641,8 @@ void Unit::Dismount()
             if (charm->IsCreature() && !charm->HasUnitState(UNIT_STATE_STUNNED))
                 charm->RemoveUnitFlag(UNIT_FLAG_STUNNED);
     }
+
+    UpdateSpeed(MOVE_RUN, true);
 }
 
 void Unit::SetImmuneToPC(bool apply, bool keepCombat)
@@ -15336,29 +15357,9 @@ void Unit::SetPhaseMask(uint32 newPhaseMask, bool update)
 
         if (!sScriptMgr->CanSetPhaseMask(this, newPhaseMask, update))
             return;
-
-        // Phase-related threat updates are done AFTER the phase change below
     }
 
     WorldObject::SetPhaseMask(newPhaseMask, false);
-
-    // Now update threat online states with the new phase mask applied
-    if (IsCreature() || (IsPlayer() && !ToPlayer()->IsGameMaster() && !ToPlayer()->GetSession()->PlayerLogout()))
-    {
-        // Update online state for units that have me on their threat list
-        for (auto const& pair : GetThreatMgr().GetThreatenedByMeList())
-        {
-            if (ThreatReference* ref = pair.second)
-                ref->UpdateOffline();
-        }
-
-        // Update online state for units on my threat list
-        if (!IsPlayer())
-        {
-            for (ThreatReference* ref : GetThreatMgr().GetModifiableThreatList())
-                ref->UpdateOffline();
-        }
-    }
 
     if (!IsInWorld())
     {
@@ -15801,15 +15802,23 @@ void Unit::_ExitVehicle(Position const* exitPosition)
         if (seatAddon)
         {
             if (seatAddon->ExitParameter == VehicleExitParameters::VehicleExitParamOffset)
+            {
                 pos.RelocateOffset({ seatAddon->ExitParameterX, seatAddon->ExitParameterY, seatAddon->ExitParameterZ, seatAddon->ExitParameterO });
+
+                bool isInLoS = GetMap()->isInLineOfSight(GetPositionX(), GetPositionY(), GetPositionZ(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
+                float floorZ = GetMapHeight(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
+
+                if (!isInLoS || pos.GetPositionZ() < floorZ)
+                    pos = vehicleBase->GetPosition();
+            }
             else if (seatAddon->ExitParameter == VehicleExitParameters::VehicleExitParamDest)
+            {
                 pos.Relocate({ seatAddon->ExitParameterX, seatAddon->ExitParameterY, seatAddon->ExitParameterZ, seatAddon->ExitParameterO });
 
-            bool isInLoS = GetMap()->isInLineOfSight(GetPositionX(), GetPositionY(), GetPositionZ(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
-            float floorZ = GetMapHeight(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
-
-            if (!isInLoS || pos.GetPositionZ() < floorZ)
-                pos = vehicleBase->GetPosition();
+                float floorZ = GetMapHeight(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
+                if (pos.GetPositionZ() < floorZ)
+                    pos.m_positionZ = floorZ + 0.1f;
+            }
         }
     }
 
