@@ -7590,6 +7590,7 @@ void Unit::UpdatePetCombatState()
 void Unit::AtExitCombat()
 {
     RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_LEAVE_COMBAT);
+    sScriptMgr->OnUnitStopCombat(this);
 }
 
 void Unit::AtEngage(Unit* /*target*/)
